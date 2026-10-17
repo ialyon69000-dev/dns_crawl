@@ -56,8 +56,18 @@ Techniques utilisées:
   • Reverse IP / Reverse NS (OSINT)
         """,
     )
-    p.add_argument("target", nargs="?", help="Domaine, NS hostname, IP ou CIDR (ex: example.com, ns1.ovh.net, 8.8.8.8, 192.168.1.0/24)")
+    p.add_argument("target", nargs="?", help="Domaine, NS hostname, IP ou CIDR (ex: example.com, ns1.ovh.net, 8.8.8.8, 192.168.1.0/24). Pour une zone entière, utilisez --zone .ru")
     p.add_argument("--type", choices=["auto", "domain", "ns", "ip", "cidr"], default="auto", help="Forcer le type de cible (défaut: auto-détection)")
+
+    # Zone entière (TLD) - nouveau
+    gz = p.add_argument_group("Zone entière (ex: .ru, .fr, .com)")
+    gz.add_argument("--zone", dest="zone", help="Énumérer tous les serveurs DNS d'une zone (ex: --zone ru, --zone .ru, --zone fr). Nécessite une liste de domaines via --input-list ou --sources")
+    gz.add_argument("--enum-ns", dest="enum_ns", action="store_true", help="Alias de --zone: énumère les NS uniques de la zone et leurs stats")
+    gz.add_argument("--input-list", dest="input_list", help="Fichier avec liste de domaines de la zone (un par ligne, txt/csv/json)")
+    gz.add_argument("--limit", type=int, default=None, help="Limiter le nombre de domaines traités (pour test, ex: --limit 1000)")
+    gz.add_argument("--sources", dest="sources", help="Sources pour récupérer domaines si pas de fichier: crt.sh,tranco (ex: --sources crt.sh --zone ru)")
+    gz.add_argument("--crawl-ns", dest="crawl_ns", action="store_true", help="Après énumération, crawler chaque NS trouvé (mode lourd, utiliser --limit pour tester)")
+    gz.add_argument("--tld-info", dest="tld_info", action="store_true", help="Affiche seulement les NS du TLD lui-même (dig NS ru), rapide")
 
     # Options techniques
     g = p.add_argument_group("Techniques")
@@ -236,6 +246,154 @@ def print_result(result, quiet: bool = False, pretty: bool = False):
     console.print(f"\n[dim]Exporter: dns-crawl {result.target} -o output.json  ou  -o output.txt  ou  --format json,csv,txt[/dim]")
 
 
+def _handle_zone_mode(args):
+    """Gère --zone / --enum-ns / --tld-info en mode zone entière"""
+    from .zone_enum import crawl_ns_zone, get_tld_nameservers, crawl_all_ns
+    from .resolver import DnsResolver
+    import json
+
+    zone = (args.zone or "").strip().lstrip(".")
+    # --tld-info seul: juste afficher les NS du TLD
+    if args.tld_info and zone:
+        console.print(BANNER)
+        console.print(f"[dim]Zone TLD demandée:[/dim] [bold white].{zone}[/bold white]")
+        res = get_tld_nameservers(zone)
+        if not res["success"]:
+            console.print(f"[red]Échec NS TLD .{zone} : aucun NS trouvé[/red]")
+            sys.exit(1)
+        table = Table(title=f"Serveurs DNS autoritaires du TLD .{zone} ({res['ns_count']})", box=box.ROUNDED)
+        table.add_column("NS hostname", style="cyan")
+        table.add_column("IPs", style="white")
+        for ns, det in res["details"].items():
+            ips = ", ".join(det["ips"][:3]) if det["ips"] else "[dim]—[/dim]"
+            table.add_row(ns, ips)
+        console.print(table)
+        console.print(f"\n[dim]Pour énumérer TOUS les NS hébergeant des domaines .{zone}, utilisez:[/dim]")
+        console.print(f"[white]  dns-crawl --zone {zone} --input-list domaines_{zone}.txt --limit 5000[/white]")
+        console.print(f"[white]  dns-crawl --zone {zone} --sources crt.sh --limit 2000[/white]")
+        if args.output:
+            Path(args.output).write_text(json.dumps(res, indent=2, ensure_ascii=False), encoding="utf-8")
+            console.print(f"[green]✓ Exporté vers {args.output}[/green]")
+        sys.exit(0)
+
+    # Mode --zone / --enum-ns
+    if zone:
+        console.print(BANNER)
+        console.print(f"[bold cyan]═══ Énumération zone .{zone} ═══[/bold cyan]")
+        # Résolveur custom si fourni
+        resolvers = [r.strip() for r in args.resolvers.split(",")] if args.resolvers else None
+        resolver = DnsResolver(nameservers=resolvers, timeout=args.timeout) if resolvers else DnsResolver(timeout=args.timeout)
+
+        # Afficher d'abord les NS du TLD lui-même
+        tld_ns_info = get_tld_nameservers(zone, resolver=resolver)
+        if tld_ns_info["success"]:
+            console.print(Panel(
+                f"TLD .{zone} géré par {tld_ns_info['ns_count']} serveurs:\n" + ", ".join(tld_ns_info["ns_hosts"]),
+                title=f"NS du TLD .{zone}", border_style="blue"
+            ))
+
+        # Sources
+        sources = [s.strip().lower() for s in args.sources.split(",")] if args.sources else None
+        if args.input_list and not Path(args.input_list).exists():
+            console.print(f"[red]Fichier introuvable: {args.input_list}[/red]")
+            sys.exit(1)
+
+        console.print(f"[dim]Énumération des NS pour .{zone}... (limit={args.limit or '∞'}, workers={args.workers})[/dim]")
+        console.print(f"[dim]Sources: {args.input_list or sources or 'auto'}[/dim]")
+
+        result = crawl_ns_zone(
+            tld=zone,
+            input_file=args.input_list,
+            limit=args.limit,
+            max_workers=args.workers,
+            resolver=resolver,
+            sources=sources,
+        )
+
+        if not result.get("success"):
+            console.print(f"[red]Erreur: {result.get('error')}[/red]")
+            sys.exit(1)
+
+        # Afficher résultats
+        enum = result["ns_enumeration"]
+        console.print(Panel(
+            f"Domaines traités: {result['domains_total']} (source: {result['domains_source']})\n"
+            f"Domaines avec NS: {enum['domains_with_ns']} / sans NS: {enum['domains_without_ns']}\n"
+            f"NS uniques trouvés: [bold green]{enum['ns_count']}[/bold green]\n"
+            f"Durée: {result['duration']:.2f}s",
+            title=f"✓ Zone .{zone} énumérée", border_style="green"
+        ))
+
+        # Top NS
+        table = Table(title=f"Top serveurs DNS hébergeant du .{zone} (sur {enum['domains_with_ns']} domaines)", box=box.ROUNDED)
+        table.add_column("#", style="dim", width=4)
+        table.add_column("NS hostname", style="cyan")
+        table.add_column("Domaines", style="white", justify="right")
+        table.add_column("%", style="green", justify="right")
+        table.add_column("IPs", style="dim")
+        for i, (ns, cnt) in enumerate(enum["top_ns"][:20], 1):
+            det = result["ns_details"].get(ns, {})
+            pct = det.get("percent", 0)
+            ips = ", ".join(det.get("ips", [])[:2]) if det.get("ips") else "—"
+            table.add_row(str(i), ns, str(cnt), f"{pct}%", ips)
+        console.print(table)
+
+        # Toutes les NS si --verbose
+        if args.verbose:
+            console.print(f"\n[dim]Liste complète ({enum['ns_count']} NS):[/dim]")
+            for ns in enum["ns_list"]:
+                console.print(f"  • {ns} ({enum['ns_counter'][ns]} domaines)")
+
+        # Crawl chaque NS si demandé
+        if args.crawl_ns:
+            console.print(f"\n[bold yellow]▶ Crawl de chaque NS ({min(len(enum['ns_list']), args.limit or len(enum['ns_list'])) } NS) → tous les sites dessus...[/bold yellow]")
+            crawl_res = crawl_all_ns(enum["ns_list"], max_workers=10, limit_ns=args.limit)
+            table2 = Table(title="Crawl reverse de chaque NS (tous les sites dessus)", box=box.ROUNDED)
+            table2.add_column("NS", style="cyan")
+            table2.add_column("Sites trouvés", style="white", justify="right")
+            for ns, data in crawl_res["per_ns"].items():
+                cnt = data.get("count", 0) if data.get("success") else f"err: {data.get('error','')[:20]}"
+                table2.add_row(ns, str(cnt))
+            console.print(table2)
+            console.print(f"[dim]Total unique across all NS: {crawl_res['total_unique_domains_across_all_ns']}[/dim]")
+            # Merger avec result pour export
+            result["crawl_ns_results"] = crawl_res
+
+        # Export
+        if args.output:
+            out_path = Path(args.output)
+            known_exts = {"json", "txt", "csv"}
+            ext = out_path.suffix.lstrip(".").lower()
+            # Pour zone, on force json si pas précisé, txt = liste NS
+            if ext == "txt":
+                # Export simple: liste NS
+                out_path.write_text("\n".join(enum["ns_list"]) + "\n", encoding="utf-8")
+                console.print(f"[green]✓ Exporté NS list vers {out_path} ({enum['ns_count']} NS)[/green]")
+            elif ext == "csv":
+                import csv
+                with out_path.open("w", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    w.writerow(["ns_hostname", "domain_count", "percent", "ips"])
+                    for ns, cnt in enum["top_ns"]:
+                        det = result["ns_details"].get(ns, {})
+                        w.writerow([ns, cnt, det.get("percent",""), ",".join(det.get("ips", []))])
+                console.print(f"[green]✓ Exporté CSV vers {out_path}[/green]")
+            else:
+                # JSON complet
+                if not ext:
+                    out_path = out_path.with_suffix(".json")
+                out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+                console.print(f"[green]✓ Exporté JSON vers {out_path} ({enum['ns_count']} NS, {result['domains_total']} domaines)[/green]")
+        else:
+            console.print(f"\n[dim]Exporter: dns-crawl --zone {zone} --limit 1000 -o output_zone_{zone}.json[/dim]")
+            console.print(f"[dim]Pour crawler chaque NS: ajoutez --crawl-ns[/dim]")
+
+        sys.exit(0)
+    elif args.enum_ns:
+        console.print("[red]--enum-ns nécessite --zone (ex: --zone ru)[/red]")
+        sys.exit(1)
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -247,6 +405,10 @@ def main():
 
     if args.list_wordlists:
         list_wordlists_and_exit()
+
+    # Mode zone prioritaire (ne nécessite pas target)
+    if args.zone or args.tld_info or args.enum_ns:
+        _handle_zone_mode(args)
 
     if not args.target:
         parser.print_help()

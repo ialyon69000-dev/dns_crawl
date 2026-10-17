@@ -134,6 +134,47 @@ crawler = DnsCrawler(config=config)
 result = crawler.crawl("ns1.hebergeur.com")  # tous les sites sur ce NS
 ```
 
+### Zone entière (ex: .ru, .fr) — Énumérer tous les NS d'une zone
+
+Nouveau : crawl d'une **zone TLD complète** (ex: `.ru` = 5M+ domaines) pour obtenir **tous les serveurs DNS qui hébergent du .ru**, puis les crawler à leur tour.
+
+```bash
+# 1. Voir les NS officiels du TLD .ru lui-même (6 serveurs, ultra rapide)
+dns-crawl --tld-info --zone ru
+
+# 2. Énumérer TOUS les NS utilisés par des domaines .ru (nécessite une liste)
+#    a) Depuis un fichier que tu as (whois dump, export, etc.)
+dns-crawl --zone ru --input-list domaines_ru.txt --limit 5000 -o ns_zone_ru.json
+
+#    b) Depuis CT logs (tente de récupérer via crt.sh, limité par API)
+dns-crawl --zone ru --sources crt.sh --limit 2000 -o ns_zone_ru.json
+
+# 3. Crawler chaque NS trouvé (tous les sites sur chaque NS) — mode lourd
+dns-crawl --zone ru --input-list domaines_ru.txt --crawl-ns --limit 100 -o crawl_zone_ru.json
+```
+
+**Python :**
+```python
+from dns_crawl.zone_enum import get_tld_nameservers, crawl_ns_zone, crawl_all_ns
+
+# NS du TLD .ru lui-même
+tld = get_tld_nameservers("ru")  # 6 serveurs: a.dns.ripn.net ...
+
+# Tous les NS hébergeant du .ru (à partir d'une liste de domaines)
+zone = crawl_ns_zone(tld="ru", input_file="domaines_ru.txt", limit=50000)
+print(zone["summary"])  # Zone .ru: 50000 domaines → 1843 NS uniques
+print(zone["ns_enumeration"]["top_ns"][:5])  # top 5 hébergeurs .ru
+
+# Crawler les 50 plus gros NS
+results = crawl_all_ns(zone["ns_enumeration"]["ns_list"][:50])
+```
+
+> **Comment obtenir la liste des domaines .ru ?**
+> - **Idéal** : dump NIC.ru / whois si tu as accès
+> - **OSINT** : `crt.sh` → `%.ru`, Tranco top 1M filtré `.ru`, CommonCrawl
+> - **Fichier** : `cat domaines.txt | dns-crawl --zone ru --input-list -`
+> - Le tool gère `--limit` pour tester progressivement (ne pas inonder le .ru en une fois)
+
 ### Interface Web (optionnelle)
 
 ```bash
@@ -154,9 +195,10 @@ dns_crawl/
 ├── dns_crawl/
 │   ├── __init__.py       # Exports publics
 │   ├── __main__.py       # python -m dns_crawl
-│   ├── cli.py            # CLI rich + argparse
+│   ├── cli.py            # CLI rich + argparse (+ --zone)
 │   ├── crawler.py        # Orchestrateur principal (DnsCrawler)
 │   ├── resolver.py       # Wrapper dnspython (multi-resolvers, cache, wildcard)
+│   ├── zone_enum.py      # Énumération zone TLD (.ru, .fr) → tous les NS
 │   ├── zone_transfer.py  # AXFR
 │   ├── ct_logs.py        # Certificate Transparency via crt.sh
 │   ├── bruteforce.py     # Bruteforce dictionnaire + wildcard filtering

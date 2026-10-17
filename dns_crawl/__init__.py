@@ -16,5 +16,6 @@ __author__ = "dns_crawl"
 
 from .crawler import DnsCrawler, CrawlResult, CrawlConfig
 from .resolver import DnsResolver
+from .zone_enum import get_tld_nameservers, crawl_ns_zone, enumerate_ns_for_domains
 
-__all__ = ["DnsCrawler", "CrawlResult", "CrawlConfig", "DnsResolver"]
+__all__ = ["DnsCrawler", "CrawlResult", "CrawlConfig", "DnsResolver", "get_tld_nameservers", "crawl_ns_zone", "enumerate_ns_for_domains"]
